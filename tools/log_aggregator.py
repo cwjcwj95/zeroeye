@@ -30,12 +30,14 @@ Usage:
     python3 log_aggregator.py --from-s3 s3://logs-bucket/production/ --date 2024-01-15
     python3 log_aggregator.py --analyze --window 1h --group-by service
     python3 log_aggregator.py --stream --filter 'severity:error'
+    python3 log_aggregator.py --input app.log --parse-error-report parse_errors.json
 """
 
 import argparse
 import collections
 import csv
 import gzip
+import hashlib
 import io
 import json
 import logging
@@ -51,6 +53,63 @@ from collections import defaultdict, Counter
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
+
+# ---------------------------------------------------------------------------
+# SANITIZATION HELPERS
+# ---------------------------------------------------------------------------
+
+_SECRET_PATTERNS = [
+    re.compile(r'[a-zA-Z0-9_]*(?:secret|key|token|password|passwd|credential|auth)[a-zA-Z0-9_]*', re.IGNORECASE),
+    re.compile(r'[a-f0-9]{32,}'),
+    re.compile(r'eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*'),
+]
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Sanitize an error message by redacting potential secret values."""
+    result = message
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub('[REDACTED]', result)
+    return result
+
+
+def _get_line_fingerprint(line: str) -> str:
+    """Generate a short hash fingerprint for a line without revealing content."""
+    return hashlib.sha256(line.encode('utf-8', errors='replace')).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# PARSE ERROR RECORD
+# ---------------------------------------------------------------------------
+
+class ParseError:
+    """Records a single parse failure without leaking raw log content."""
+
+    def __init__(
+        self,
+        parser_type: str,
+        filepath: str,
+        line_number: int,
+        error_message: str,
+        line_fingerprint: str,
+    ):
+        self.parser_type = parser_type
+        self.filepath = filepath
+        self.line_number = line_number
+        self.error_message = _sanitize_error_message(error_message)
+        self.line_fingerprint = line_fingerprint
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'parser_type': self.parser_type,
+            'filepath': self.filepath,
+            'line_number': self.line_number,
+            'error_message': self.error_message,
+            'line_fingerprint': self.line_fingerprint,
+            'timestamp': self.timestamp,
+        }
+
 
 # ---------------------------------------------------------------------------
 # LOG PARSERS
@@ -75,6 +134,23 @@ class LogParser:
 
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
+
+    def parse_with_error(self, line: str, filepath: str, line_number: int) -> Tuple[Optional[Dict[str, Any]], Optional[ParseError]]:
+        """Parse a line and return either the entry or a parse error record."""
+        try:
+            result = self.parse(line)
+            if result is not None:
+                return result, None
+            return None, None
+        except Exception as e:
+            error = ParseError(
+                parser_type=self.__class__.__name__,
+                filepath=filepath,
+                line_number=line_number,
+                error_message=str(e),
+                line_fingerprint=_get_line_fingerprint(line),
+            )
+            return None, error
 
     def extract_timestamp(self, line: str) -> Optional[int]:
         for pattern, _ in self.TIMESTAMP_PATTERNS:
@@ -129,8 +205,8 @@ class JSONLogParser(LogParser):
                 'fields': entry,
                 'format': 'json',
             }
-        except json.JSONDecodeError:
-            return None
+        except json.JSONDecodeError as e:
+            raise e
 
 
 class TextLogParser(LogParser):
@@ -212,19 +288,24 @@ class LogAggregator:
         self.error_patterns: Counter = Counter()
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
+        self.parse_errors: List[ParseError] = []
+        self.parse_error_counts: Counter = Counter()
 
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
+        line_number = 0
         try:
             if filepath.endswith('.gz'):
                 with gzip.open(filepath, 'rt', errors='replace') as f:
                     for line in f:
-                        if self._parse_line(line):
+                        line_number += 1
+                        if self._parse_line(line, filepath, line_number):
                             parsed_count += 1
             else:
                 with open(filepath, 'r', errors='replace') as f:
                     for line in f:
-                        if self._parse_line(line):
+                        line_number += 1
+                        if self._parse_line(line, filepath, line_number):
                             parsed_count += 1
         except Exception as e:
             logger.error(f"Error processing {filepath}: {e}")
@@ -240,9 +321,13 @@ class LogAggregator:
             logger.debug(f"  {filepath.name}: {count} entries")
         return total
 
-    def _parse_line(self, line: str) -> bool:
+    def _parse_line(self, line: str, filepath: str, line_number: int) -> bool:
         for parser in self.parsers:
-            entry = parser.parse(line)
+            entry, error = parser.parse_with_error(line, filepath, line_number)
+            if error:
+                self.parse_errors.append(error)
+                self.parse_error_counts[error.parser_type] += 1
+                return False
             if entry:
                 self.entries.append(entry)
                 ts = entry.get('timestamp')
@@ -260,6 +345,17 @@ class LogAggregator:
                     self.errors_by_service[service].append(msg)
                     self.error_patterns[msg] += 1
                 return True
+        # No parser matched - count as text parse failure if line is non-empty
+        stripped = line.strip()
+        if stripped:
+            self.parse_errors.append(ParseError(
+                parser_type='UnmatchedLine',
+                filepath=filepath,
+                line_number=line_number,
+                error_message='No parser matched the line format',
+                line_fingerprint=_get_line_fingerprint(line),
+            ))
+            self.parse_error_counts['UnmatchedLine'] += 1
         return False
 
     def get_summary(self) -> Dict[str, Any]:
@@ -275,7 +371,37 @@ class LogAggregator:
                 svc: len(errors)
                 for svc, errors in self.errors_by_service.items()
             },
+            'parse_errors': {
+                'total_count': len(self.parse_errors),
+                'by_parser': dict(self.parse_error_counts.most_common()),
+            },
         }
+
+    def get_parse_error_report(self) -> Dict[str, Any]:
+        """Generate a sanitized parse-error summary report."""
+        by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for error in self.parse_errors:
+            by_file[error.filepath].append(error.to_dict())
+
+        return {
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'total_parse_errors': len(self.parse_errors),
+            'by_parser': dict(self.parse_error_counts.most_common()),
+            'files': {
+                filepath: {
+                    'error_count': len(errors),
+                    'errors': errors,
+                }
+                for filepath, errors in sorted(by_file.items())
+            },
+        }
+
+    def export_parse_error_report(self, output_path: str):
+        """Export parse-error report to a JSON file."""
+        report = self.get_parse_error_report()
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        logger.info(f"Parse-error report exported to {output_path}")
 
     def _get_time_range(self) -> Optional[Dict[str, str]]:
         timestamps = [
@@ -397,7 +523,20 @@ th {{ background: #1e293b; color: #94a3b8; }}
 <div class="card"><h2>Error Rate</h2>
   <div class="stat error">{:.2f}%</div>
   <div class="label">of all log entries</div>
-</div></body></html>""".format(summary.get('error_rate', 0))
+</div>""".format(summary.get('error_rate', 0))
+
+        # Add parse error section if present
+        parse_err = summary.get('parse_errors', {})
+        if parse_err and parse_err.get('total_count', 0) > 0:
+            html += f"""<div class="card"><h2>Parse Errors</h2>
+  <div class="stat warn">{parse_err['total_count']}</div>
+  <div class="label">lines failed to parse</div>
+  <table><tr><th>Parser</th><th>Count</th></tr>"""
+            for parser, count in parse_err.get('by_parser', {}).items():
+                html += f"<tr><td>{parser}</td><td>{count}</td></tr>"
+            html += "</table></div>"
+
+        html += "</body></html>"
 
         with open(output_path, 'w') as f:
             f.write(html)
@@ -411,6 +550,7 @@ def parse_args():
     parser.add_argument("--output", "-o", default="log_report.json", help="Output file path")
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
+    parser.add_argument("--parse-error-report", help="Output path for a JSON parse-error summary")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -452,12 +592,19 @@ def main():
     print(f"  By level: {', '.join(f'{k}={v}' for k, v in summary.get('by_level', {}).items())}")
     print(f"  By service: {', '.join(f'{k}={v}' for k, v in summary.get('by_service', {}).items())}")
 
+    if summary.get('parse_errors', {}).get('total_count', 0) > 0:
+        pe = summary['parse_errors']
+        print(f"  Parse errors: {pe['total_count']} (by parser: {', '.join(f'{k}={v}' for k, v in pe.get('by_parser', {}).items())})")
+
     if args.format == "csv":
         aggregator.export_csv(args.output)
     elif args.format == "html":
         aggregator.generate_html_report(args.output)
     else:
         aggregator.export_json(args.output)
+
+    if args.parse_error_report:
+        aggregator.export_parse_error_report(args.parse_error_report)
 
     return 0
 
